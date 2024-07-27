@@ -1,0 +1,21 @@
+permissions:
+  contents: read
+
+name: machete-action
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+jobs:
+  machete:
+    name: 'cargo-machete for ${{ github.event_name }}'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
+      - uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # master
+        with:
+          components: clippy
+          targets: x86_64-unknown-linux-gnu
+          toolchain: nightly
+      - run: cargo install cargo-machete
+      - run: cargo machete --with-metadata

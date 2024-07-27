@@ -1,0 +1,24 @@
+[package]
+name = "optiepub"
+version = "0.1.0"
+authors = []
+edition = "2021"
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+zip = "2.1.5"
+eyre = "0.6.12"
+oxipng = "9.1.2"
+regex = "1.10.5"
+image = "0.25.2"
+mozjpeg = "0.10.9"
+imageproc = "0.25.0"
+image_hasher = "2.0.0"
+argh = "0.1.12"
+indicatif = "0.17.8"
+
+[dev-dependencies]
+tempfile = "3.10.1"

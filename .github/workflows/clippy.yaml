@@ -1,0 +1,33 @@
+permissions:
+  contents: read
+  checks: write
+
+name: clippy-action
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+jobs:
+  clippy:
+    name: 'Clippy for ${{ github.event_name }}'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@692973e3d937129bcbf40652eb9f2f61becf3332 # v4
+      - run: sudo apt-get install -y gcc-mingw-w64
+      - uses: dtolnay/rust-toolchain@21dc36fb71dd22e3317045c0c31a3f4249868b17 # master
+        with:
+          components: clippy
+          targets: x86_64-pc-windows-gnu, x86_64-unknown-linux-gnu
+          toolchain: nightly
+      - run: |
+          cargo check --workspace
+      - uses: giraffate/clippy-action@13b9d32482f25d29ead141b79e7e04e7900281e0 # v1
+        with:
+          # debugging:
+          # clippy_debug: true
+          # reviewdog_flags: -tee
+          level: warning
+          filter_mode: nofilter
+          clippy_flags: --workspace
+          reporter: ${{ github.event_name != 'push' && 'github-pr-check' || 'github-check' }}
+          github_token: ${{ secrets.GITHUB_TOKEN }}
