@@ -19,6 +19,8 @@ imageproc = "0.25.0"
 image_hasher = "2.0.0"
 argh = "0.1.12"
 indicatif = "0.17.8"
+env_logger = "0.11.5"
+log = "0.4.22"
 
 [dev-dependencies]
 tempfile = "3.10.1"

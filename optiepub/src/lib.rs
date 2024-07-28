@@ -1,14 +1,16 @@
 use argh::FromArgs;
-use eyre::Result;
+use eyre::{Result, WrapErr};
 use image::imageops::FilterType::Lanczos3;
 use image::{DynamicImage, GenericImageView, ImageReader, Rgba};
 use indicatif::{ProgressBar, ProgressStyle};
+use log::{debug, info};
 use regex::Regex;
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::LazyLock;
+use zip::result::ZipError;
 use zip::write::SimpleFileOptions;
 use zip::{ZipArchive, ZipWriter};
 
@@ -17,37 +19,49 @@ static FIGURE_REF_REGEX: LazyLock<Regex> =
 
 static FILE_REFS_REGEX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r#"(?i)src\s*=\s*"([^"<>]+?)""#).unwrap());
 
-#[derive(FromArgs)]
+#[derive(FromArgs, Default)]
 /// Optimize EPUB files by compressing images and removing unnecessary content.
-#[derive(Default)]
 pub struct Cli {
 	/// input EPUB file path
 	#[argh(positional)]
-	input: PathBuf,
+	pub input: PathBuf,
 
-	/// output EPUB file path
+	/// output EPUB file path (default: input_optimized.epub)
 	#[argh(option, short = 'o')]
-	output: Option<PathBuf>,
+	pub output: Option<PathBuf>,
 
-	/// JPEG quality (1-100)
+	/// JPEG quality (1-100, default: 75)
 	#[argh(option, short = 'q', default = "75")]
-	jpeg_quality: u8,
+	pub quality: u8,
 
-	/// maximum image dimension
+	/// maximum image dimension (default: 1440)
 	#[argh(option, short = 'd', default = "1440")]
-	max_dimension: u32,
+	pub max_dimension: u32,
 
-	/// hash distance for considering images similar
+	/// hash distance for considering images similar (default: 6)
 	#[argh(option, short = 'h', default = "6")]
-	hash_distance: u32,
+	pub hash_distance: u32,
 
-	/// log more info when processing epubs
-	#[argh(switch, short = 'v')]
-	verbose: bool,
+	/// verbosity level (-v for debug, -vv)
+	#[argh(option, short = 'v', from_str_fn(parse_verbosity), default = "1")]
+	pub verbose: u8,
 
-	/// show a progress bar
-	#[argh(switch, short = 'p')]
-	no_progress: bool,
+	/// hide progress bar
+	#[argh(switch)]
+	pub quiet: bool,
+
+	/// perform a dry run without modifying files
+	#[argh(switch)]
+	pub dry_run: bool,
+}
+
+fn parse_verbosity(value: &str) -> Result<u8, String> {
+	match value {
+		"" => Ok(1),   // -v
+		"v" => Ok(2),  // -vv
+		"vv" => Ok(3), // -vvv
+		_ => Err(String::from("Invalid verbosity level")),
+	}
 }
 
 #[derive(Default)]
@@ -78,10 +92,27 @@ struct ImmutableState<'a> {
 
 struct MutableState<ZW: io::Read + io::Seek + io::Write = File> {
 	zip: ZipArchive<ZW>,
-	outzip: ZipWriter<ZW>,
+	outzip: Box<dyn ZipOutput>,
 	image_hashes: HashMap<String, (ImageHash, ImageHash)>,
 	optimized_images: HashMap<String, String>,
 	stats: Statistics,
+}
+
+trait ZipOutput: Write {
+	fn start_file(&mut self, name: &str, options: SimpleFileOptions) -> Result<(), ZipError>;
+	fn finish(self: Box<Self>) -> Result<u64, ZipError>;
+}
+
+impl<T: Read + Write + Seek + 'static> ZipOutput for ZipWriter<T> {
+	fn start_file(&mut self, name: &str, options: SimpleFileOptions) -> Result<(), ZipError> {
+		ZipWriter::start_file(self, name, options)
+	}
+
+	fn finish(self: Box<Self>) -> Result<u64, ZipError> {
+		let writer = *self;
+		let mut finished = writer.finish()?;
+		Ok(finished.seek(SeekFrom::End(0))?)
+	}
 }
 
 fn comp_jpeg(image: DynamicImage, quality: f32) -> Result<Vec<u8>> {
@@ -203,48 +234,46 @@ fn crop_transparent_and_black(img: DynamicImage) -> DynamicImage {
 	}
 }
 
-fn optimize_image(cli: &Cli, name: &str, image: &[u8], max_dim: u32, jpeg_quality: f32) -> Result<(&'static str, Vec<u8>, ImageHash)> {
-	if cli.verbose {
-		eprintln!("Optimizing image: {}", name);
-	}
+fn optimize_image(name: &str, image: &[u8], max_dim: u32, jpeg_quality: f32) -> Result<(&'static str, Vec<u8>, ImageHash)> {
+	debug!("Optimizing image: {}", name);
 
-	let mut img_rs = ImageReader::new(Cursor::new(image)).with_guessed_format()?.decode()?;
+	let mut img_rs = ImageReader::new(Cursor::new(image))
+		.with_guessed_format()
+		.wrap_err_with(|| format!("Failed to guess image format for {}", name))?
+		.decode()
+		.wrap_err_with(|| format!("Failed to decode image {}", name))?;
 
-	if cli.verbose {
-		eprintln!("Original dimensions: {}x{}", img_rs.width(), img_rs.height());
-	}
+	debug!("Original dimensions: {}x{}", img_rs.width(), img_rs.height());
 
 	img_rs = crop_transparent_and_black(img_rs);
 
-	if cli.verbose {
-		eprintln!("Dimensions after cropping: {}x{}", img_rs.width(), img_rs.height());
-	}
+	debug!("Dimensions after cropping: {}x{}", img_rs.width(), img_rs.height());
 
 	if img_rs.width() > max_dim || img_rs.height() > max_dim {
 		img_rs = img_rs.resize(max_dim, max_dim, Lanczos3);
-		if cli.verbose {
-			eprintln!("Resized to: {}x{}", img_rs.width(), img_rs.height());
-		}
+		debug!("Resized to: {}x{}", img_rs.width(), img_rs.height());
 	}
 
 	if !needs_alpha(&img_rs) {
 		let img_rs = DynamicImage::from(img_rs.into_rgb8());
 		let hash = calculate_image_hash_from_loaded_image(&img_rs);
 
-		if cli.verbose {
-			eprintln!("Optimizing as JPEG");
-		}
+		debug!("Optimizing as JPEG");
 
-		return Ok(("jpg", comp_jpeg(img_rs, jpeg_quality)?, hash));
+		return Ok((
+			"jpg",
+			comp_jpeg(img_rs, jpeg_quality).wrap_err_with(|| format!("Failed to compress JPEG for {}", name))?,
+			hash,
+		));
 	}
 
 	let hash = calculate_image_hash_from_loaded_image(&img_rs);
 	let mut bytes: Vec<u8> = Vec::new();
-	img_rs.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)?;
+	img_rs
+		.write_to(&mut Cursor::new(&mut bytes), image::ImageFormat::Png)
+		.wrap_err_with(|| format!("Failed to write image {} to buffer", name))?;
 
-	if cli.verbose {
-		eprintln!("Optimizing as PNG");
-	}
+	debug!("Optimizing as PNG");
 
 	Ok((
 		"png",
@@ -254,13 +283,16 @@ fn optimize_image(cli: &Cli, name: &str, image: &[u8], max_dim: u32, jpeg_qualit
 				fix_errors: true,
 				..Default::default()
 			},
-		)?,
+		)
+		.wrap_err_with(|| format!("Failed to optimize PNG for {}", name))?,
 		hash,
 	))
 }
 
 fn calculate_image_hash(image_data: &[u8]) -> Result<ImageHash> {
-	Ok(calculate_image_hash_from_loaded_image(&image::load_from_memory(image_data)?))
+	Ok(calculate_image_hash_from_loaded_image(
+		&image::load_from_memory(image_data).wrap_err("Failed to load image for hashing")?,
+	))
 }
 
 fn calculate_image_hash_from_loaded_image(image_data: &DynamicImage) -> ImageHash {
@@ -268,17 +300,23 @@ fn calculate_image_hash_from_loaded_image(image_data: &DynamicImage) -> ImageHas
 	hasher.hash_image(image_data)
 }
 
-fn add_mimetype_file(outzip: &mut ZipWriter<File>) -> Result<()> {
+fn add_mimetype_file(outzip: &mut (impl ZipOutput + ?Sized)) -> Result<()> {
 	let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
-	outzip.start_file("mimetype", options)?;
-	outzip.write_all(b"application/epub+zip")?;
+	outzip
+		.start_file("mimetype", options)
+		.wrap_err("Failed to start mimetype file in ZIP")?;
+	outzip
+		.write_all(b"application/epub+zip")
+		.wrap_err("Failed to write mimetype content")?;
 	Ok(())
 }
 
 fn collect_image_paths(zip: &mut ZipArchive<impl io::Read + io::Seek>) -> Result<HashMap<String, String>> {
 	let mut image_paths = HashMap::new();
 	for i in 0..zip.len() {
-		let file = zip.by_index(i)?;
+		let file = zip
+			.by_index(i)
+			.wrap_err_with(|| format!("Failed to read ZIP file entry at index {}", i))?;
 		if file.is_file() {
 			if let Some(ext) = get_file_extension(file.name()) {
 				if ["png", "webp", "jpeg", "jpg"].contains(&ext.to_ascii_lowercase().as_str()) {
@@ -299,18 +337,42 @@ fn get_file_extension(name: &str) -> Option<String> {
 }
 
 pub fn optimize(cli: &Cli) -> Result<()> {
-	let mut zip = ZipArchive::new(File::open(&cli.input)?)?;
+	let log_level = match cli.quiet {
+		true => log::LevelFilter::Error,
+		false => match cli.verbose {
+			0 => log::LevelFilter::Warn,
+			1 => log::LevelFilter::Info,
+			2 => log::LevelFilter::Debug,
+			_ => log::LevelFilter::Trace,
+		},
+	};
+	env_logger::Builder::from_default_env().filter_level(log_level).init();
+
+	info!("Starting EPUB optimization");
+	debug!("Input file: {:?}", cli.input);
+	debug!("Output file: {:?}", cli.output);
+
+	if cli.dry_run {
+		info!("Performing dry run - no files will be modified");
+	}
+
+	let mut zip = ZipArchive::new(File::open(&cli.input).wrap_err_with(|| format!("Failed to open input EPUB file: {:?}", cli.input))?)?;
 
 	let output_path = cli.output.as_ref().cloned().unwrap_or_else(|| {
 		cli.input
 			.with_file_name(format!("{}_optimized.epub", cli.input.file_stem().unwrap().to_string_lossy()))
 	});
-
-	let outzip = ZipWriter::new(File::create(&output_path)?);
+	let outzip: Box<dyn ZipOutput> = if cli.dry_run {
+		Box::new(ZipWriter::new(Cursor::new(Vec::new())))
+	} else {
+		Box::new(ZipWriter::new(
+			File::create(&output_path).wrap_err_with(|| format!("Failed to create output EPUB file: {:?}", output_path))?,
+		))
+	};
 
 	let image_paths = collect_image_paths(&mut zip)?;
 
-	let progress_bar = if cli.no_progress {
+	let progress_bar = if cli.quiet {
 		None
 	} else {
 		Some(ProgressBar::new(zip.len() as u64))
@@ -339,10 +401,14 @@ pub fn optimize(cli: &Cli) -> Result<()> {
 		stats: Statistics::default(),
 	};
 
-	mutable_state.stats.original_size = std::fs::metadata(&cli.input)?.len();
+	mutable_state.stats.original_size = std::fs::metadata(&cli.input)
+		.wrap_err_with(|| format!("Failed to get metadata for input file: {:?}", cli.input))?
+		.len();
 	mutable_state.stats.total_images = immutable_state.image_paths.len();
 
-	add_mimetype_file(&mut mutable_state.outzip)?;
+	if !cli.dry_run {
+		add_mimetype_file(&mut *mutable_state.outzip)?;
+	}
 
 	for i in 0..mutable_state.zip.len() {
 		if let Some(p) = &immutable_state.progress_bar {
@@ -356,6 +422,8 @@ pub fn optimize(cli: &Cli) -> Result<()> {
 			p.set_message(format!("Processing {}", name));
 		}
 
+		debug!("Processing file: {}", name);
+
 		if name == "mimetype" {
 			continue;
 		}
@@ -368,39 +436,46 @@ pub fn optimize(cli: &Cli) -> Result<()> {
 				let mut html_content = String::new();
 				{
 					let mut file = file;
-					file.read_to_string(&mut html_content)?;
+					file.read_to_string(&mut html_content)
+						.wrap_err_with(|| format!("Failed to read HTML content from {}", name))?;
 				}
 				process_html_file(&immutable_state, &mut mutable_state, html_content, &name)?;
 			}
 			_ => {
 				let mut file = file;
-				copy_file_to_output(&mut file, &name, &mut mutable_state.outzip)?;
+				if !cli.dry_run {
+					copy_file_to_output(&mut file, &name, &mut *mutable_state.outzip)
+						.wrap_err_with(|| format!("Failed to copy file {} to output", name))?;
+				}
 			}
 		}
 	}
 
-	mutable_state.outzip.finish()?;
-	mutable_state.stats.optimized_size = std::fs::metadata(&output_path)?.len();
+	mutable_state.stats.optimized_size = mutable_state.outzip.finish().wrap_err("Failed to finalize output EPUB file")?;
 
 	if let Some(p) = &immutable_state.progress_bar {
-		p.finish_with_message(format!(
-			"Optimization complete, saved to {}.\n\
-					 Total images: {}\n\
-					 Optimized images: {}\n\
-					 Removed unused: {}\n\
-					 Removed duplicate: {}\n\
-					 Original size: {:.2} MiB\n\
-					 Optimized size: {:.2} MiB\n\
-					 Percentage saved: {:.2}%",
-			output_path.display(),
-			mutable_state.stats.total_images,
-			mutable_state.stats.optimized_images,
-			mutable_state.stats.removed_unused,
-			mutable_state.stats.removed_duplicate,
-			mutable_state.stats.original_size as f32 / (1024.0 * 1024.0),
-			mutable_state.stats.optimized_size as f32 / (1024.0 * 1024.0),
-			mutable_state.stats.percentage_saved(),
-		));
+		p.finish_with_message("Optimization complete");
+	}
+
+	info!("Optimization complete");
+	info!("Total images: {}", mutable_state.stats.total_images);
+	info!("Optimized images: {}", mutable_state.stats.optimized_images);
+	info!("Removed unused: {}", mutable_state.stats.removed_unused);
+	info!("Removed duplicate: {}", mutable_state.stats.removed_duplicate);
+	info!(
+		"Original size: {:.2} MiB",
+		mutable_state.stats.original_size as f32 / (1024.0 * 1024.0)
+	);
+	info!(
+		"Optimized size: {:.2} MiB",
+		mutable_state.stats.optimized_size as f32 / (1024.0 * 1024.0)
+	);
+	info!("Percentage saved: {:.2}%", mutable_state.stats.percentage_saved());
+
+	if cli.dry_run {
+		info!("Dry run completed. No files were modified.");
+	} else {
+		info!("Optimized EPUB saved to: {}", output_path.display());
 	}
 
 	Ok(())
@@ -412,11 +487,19 @@ fn process_html_file(immutable_state: &ImmutableState, mutable_state: &mut Mutab
 	let content = replace_image_references(&FILE_REFS_REGEX, immutable_state, mutable_state, &html_content, &html_folder);
 	let content = replace_image_references(&FIGURE_REF_REGEX, immutable_state, mutable_state, &content, &html_folder);
 
-	mutable_state.outzip.start_file(
-		name,
-		SimpleFileOptions::default().compression_method(zip::CompressionMethod::DEFLATE),
-	)?;
-	mutable_state.outzip.write_all(content.as_bytes())?;
+	if !immutable_state.cli.dry_run {
+		mutable_state
+			.outzip
+			.start_file(
+				name,
+				SimpleFileOptions::default().compression_method(zip::CompressionMethod::DEFLATE),
+			)
+			.wrap_err_with(|| format!("Failed to start HTML file {} in output ZIP", name))?;
+		mutable_state
+			.outzip
+			.write_all(content.as_bytes())
+			.wrap_err_with(|| format!("Failed to write HTML content for {} to output ZIP", name))?;
+	}
 
 	Ok(())
 }
@@ -436,7 +519,7 @@ fn replace_image_references(
 					.image_paths
 					.get(&resolved_path.to_string_lossy().to_ascii_lowercase())
 				{
-					let new_path = get_or_create_optimized_image(immutable_state, mutable_state, img_path);
+					let new_path = get_or_create_optimized_image(immutable_state, mutable_state, img_path).unwrap();
 					let relativized = make_rel_path(html_folder, Path::new(&new_path));
 					return if cap[0].to_ascii_lowercase().starts_with("<svg") {
 						format!(r#"<img src="{}"/>"#, relativized.display())
@@ -448,9 +531,7 @@ fn replace_image_references(
 				}
 			}
 
-			if immutable_state.cli.verbose {
-				eprintln!("Skipping unknown image {} referenced in {}", &cap[0], html_folder.display());
-			}
+			debug!("Skipping unknown image {} referenced in {}", &cap[0], html_folder.display());
 			cap[0].to_string()
 		})
 		.into_owned()
@@ -460,9 +541,9 @@ fn get_or_create_optimized_image(
 	immutable_state: &ImmutableState,
 	mutable_state: &mut MutableState<impl io::Read + io::Seek + io::Write>,
 	img_path: &str,
-) -> String {
+) -> Result<String> {
 	if let Some(optimized_path) = mutable_state.optimized_images.get(img_path) {
-		return optimized_path.clone();
+		return Ok(optimized_path.clone());
 	}
 
 	let mut buf = vec![];
@@ -479,11 +560,10 @@ fn get_or_create_optimized_image(
 		existing_path.clone()
 	} else {
 		let (new_ext, res, optimized_hash) = optimize_image(
-			immutable_state.cli,
 			img_path,
 			&buf,
 			immutable_state.cli.max_dimension,
-			immutable_state.cli.jpeg_quality as f32,
+			immutable_state.cli.quality as f32,
 		)
 		.unwrap();
 
@@ -496,17 +576,20 @@ fn get_or_create_optimized_image(
 			existing_path.clone()
 		} else {
 			let new_path = swap_ext(img_path, new_ext);
-			if immutable_state.cli.verbose {
-				eprintln!("Saving optimized image to {new_path}");
+			debug!("Saving optimized image to {new_path}");
+			if !immutable_state.cli.dry_run {
+				mutable_state
+					.outzip
+					.start_file(
+						&new_path,
+						SimpleFileOptions::default().compression_method(zip::CompressionMethod::DEFLATE),
+					)
+					.wrap_err_with(|| format!("Failed to start file {} in output ZIP", new_path))?;
+				mutable_state
+					.outzip
+					.write_all(&res)
+					.wrap_err_with(|| format!("Failed to write optimized image data for {} to output ZIP", new_path))?;
 			}
-			mutable_state
-				.outzip
-				.start_file(
-					new_path.to_owned(),
-					SimpleFileOptions::default().compression_method(zip::CompressionMethod::DEFLATE),
-				)
-				.unwrap();
-			mutable_state.outzip.write_all(&res).unwrap();
 
 			mutable_state.image_hashes.insert(new_path.clone(), (original_hash, optimized_hash));
 			mutable_state.stats.optimized_images += 1;
@@ -515,15 +598,17 @@ fn get_or_create_optimized_image(
 	};
 
 	mutable_state.optimized_images.insert(img_path.to_owned(), new_path.clone());
-	new_path
+	Ok(new_path)
 }
 
-fn copy_file_to_output(file: &mut zip::read::ZipFile, name: &str, outzip: &mut ZipWriter<File>) -> Result<()> {
-	outzip.start_file(
-		name,
-		SimpleFileOptions::default().compression_method(zip::CompressionMethod::DEFLATE),
-	)?;
-	std::io::copy(file, outzip)?;
+fn copy_file_to_output(file: &mut zip::read::ZipFile, name: &str, outzip: &mut dyn ZipOutput) -> Result<()> {
+	outzip
+		.start_file(
+			name,
+			SimpleFileOptions::default().compression_method(zip::CompressionMethod::DEFLATE),
+		)
+		.wrap_err_with(|| format!("Failed to start file {} in output ZIP", name))?;
+	std::io::copy(file, outzip).wrap_err_with(|| format!("Failed to copy file {} to output ZIP", name))?;
 	Ok(())
 }
 
@@ -607,11 +692,11 @@ mod tests {
 		let cli = Cli {
 			input: temp_file.path().to_path_buf(),
 			output: Some(output_file.path().to_path_buf()),
-			jpeg_quality: 75,
+			quality: 75,
 			max_dimension: 500, // Set to a smaller value to ensure resizing
 			hash_distance: 6,
-			verbose: true,
-			no_progress: false,
+			verbose: 3,
+			..Default::default()
 		};
 
 		// Run the optimize function
@@ -709,7 +794,7 @@ mod tests {
 	#[test]
 	fn test_optimize_image() -> Result<()> {
 		let image_data = create_dummy_png(100, 100);
-		let (format, optimized, _) = optimize_image(&Default::default(), "test.png", &image_data, 50, 75.0)?;
+		let (format, optimized, _) = optimize_image("test.png", &image_data, 50, 75.0)?;
 		assert!(format == "jpg" || format == "png");
 		assert!(optimized.len() < image_data.len());
 		Ok(())
@@ -781,11 +866,11 @@ mod tests {
 		let cli = Cli {
 			input: PathBuf::new(),
 			output: None,
-			jpeg_quality: 75,
+			quality: 75,
 			max_dimension: 1440,
 			hash_distance: 6,
-			verbose: false,
-			no_progress: true,
+			verbose: 3,
+			..Default::default()
 		};
 		let immutable_state = ImmutableState {
 			cli: &cli,
@@ -795,9 +880,10 @@ mod tests {
 				.collect(),
 			progress_bar: None,
 		};
+
 		let mut mutable_state = MutableState {
 			zip: ZipArchive::new(zip_data)?,
-			outzip: ZipWriter::new(Cursor::new(Vec::new())),
+			outzip: Box::new(ZipWriter::new(Cursor::new(Vec::new()))),
 			image_hashes: HashMap::new(),
 			optimized_images: HashMap::new(),
 			stats: Statistics::default(),
