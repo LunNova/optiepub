@@ -1,4 +1,5 @@
 use argh::FromArgs;
+use enum_dispatch::enum_dispatch;
 use eyre::{Result, WrapErr};
 use image::imageops::FilterType::Lanczos3;
 use image::{DynamicImage, GenericImageView, ImageReader, Rgba};
@@ -90,29 +91,72 @@ struct ImmutableState<'a> {
 	progress_bar: Option<ProgressBar>,
 }
 
-struct MutableState<ZW: io::Read + io::Seek + io::Write = File> {
-	zip: ZipArchive<ZW>,
-	outzip: Box<dyn ZipOutput>,
+struct MutableState {
+	zip: ZipArchiveEnum,
+	outzip: ZipWriterEnum,
 	image_hashes: HashMap<String, (ImageHash, ImageHash)>,
 	optimized_images: HashMap<String, String>,
 	stats: Statistics,
 }
 
-trait ZipOutput: Write {
-	fn start_file(&mut self, name: &str, options: SimpleFileOptions) -> Result<(), ZipError>;
-	fn finish(self: Box<Self>) -> Result<u64, ZipError>;
+#[enum_dispatch(ZipArchiveEnum)]
+trait ZipArchiveOps {
+	fn by_index(&mut self, index: usize) -> Result<zip::read::ZipFile>;
+	fn by_name(&mut self, name: &str) -> Result<zip::read::ZipFile>;
+	fn len(&self) -> usize;
 }
 
-impl<T: Read + Write + Seek + 'static> ZipOutput for ZipWriter<T> {
-	fn start_file(&mut self, name: &str, options: SimpleFileOptions) -> Result<(), ZipError> {
-		ZipWriter::start_file(self, name, options)
+#[enum_dispatch(ZipWriterEnum)]
+trait ZipWriterOps {
+	fn start_file(&mut self, name: &str, options: SimpleFileOptions) -> Result<(), ZipError>;
+	fn finish(self) -> Result<u64, ZipError>;
+	fn write_all(&mut self, buf: &[u8]) -> Result<()>;
+	fn copy_from(&mut self, src: &mut impl io::Read) -> Result<u64>;
+}
+
+impl<T: Read + Seek> ZipArchiveOps for ZipArchive<T> {
+	fn by_index(&mut self, index: usize) -> Result<zip::read::ZipFile> {
+		Ok(self.by_index(index)?)
 	}
 
-	fn finish(self: Box<Self>) -> Result<u64, ZipError> {
-		let writer = *self;
-		let mut finished = writer.finish()?;
-		Ok(finished.seek(SeekFrom::End(0))?)
+	fn by_name(&mut self, name: &str) -> Result<zip::read::ZipFile> {
+		Ok(self.by_name(name)?)
 	}
+
+	fn len(&self) -> usize {
+		self.len()
+	}
+}
+
+impl<T: Read + Write + Seek> ZipWriterOps for ZipWriter<T> {
+	fn start_file(&mut self, name: &str, options: SimpleFileOptions) -> Result<(), ZipError> {
+		self.start_file(name, options)
+	}
+
+	fn finish(self) -> Result<u64, ZipError> {
+		let mut inner = self.finish()?;
+		Ok(inner.seek(SeekFrom::End(0))?)
+	}
+
+	fn write_all(&mut self, buf: &[u8]) -> Result<()> {
+		Ok(<Self as Write>::write_all(self, buf)?)
+	}
+
+	fn copy_from(&mut self, src: &mut impl io::Read) -> Result<u64> {
+		Ok(io::copy(src, self)?)
+	}
+}
+
+#[enum_dispatch]
+enum ZipArchiveEnum {
+	File(ZipArchive<File>),
+	Memory(ZipArchive<Cursor<Vec<u8>>>),
+}
+
+#[enum_dispatch]
+enum ZipWriterEnum {
+	File(ZipWriter<File>),
+	Memory(ZipWriter<Cursor<Vec<u8>>>),
 }
 
 fn comp_jpeg(image: DynamicImage, quality: f32) -> Result<Vec<u8>> {
@@ -300,7 +344,7 @@ fn calculate_image_hash_from_loaded_image(image_data: &DynamicImage) -> ImageHas
 	hasher.hash_image(image_data)
 }
 
-fn add_mimetype_file(outzip: &mut (impl ZipOutput + ?Sized)) -> Result<()> {
+fn add_mimetype_file(outzip: &mut ZipWriterEnum) -> Result<()> {
 	let options = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
 	outzip
 		.start_file("mimetype", options)
@@ -311,7 +355,7 @@ fn add_mimetype_file(outzip: &mut (impl ZipOutput + ?Sized)) -> Result<()> {
 	Ok(())
 }
 
-fn collect_image_paths(zip: &mut ZipArchive<impl io::Read + io::Seek>) -> Result<HashMap<String, String>> {
+fn collect_image_paths(zip: &mut ZipArchiveEnum) -> Result<HashMap<String, String>> {
 	let mut image_paths = HashMap::new();
 	for i in 0..zip.len() {
 		let file = zip
@@ -356,16 +400,17 @@ pub fn optimize(cli: &Cli) -> Result<()> {
 		info!("Performing dry run - no files will be modified");
 	}
 
-	let mut zip = ZipArchive::new(File::open(&cli.input).wrap_err_with(|| format!("Failed to open input EPUB file: {:?}", cli.input))?)?;
+	let mut zip: ZipArchiveEnum =
+		ZipArchive::new(File::open(&cli.input).wrap_err_with(|| format!("Failed to open input EPUB file: {:?}", cli.input))?)?.into();
 
 	let output_path = cli.output.as_ref().cloned().unwrap_or_else(|| {
 		cli.input
 			.with_file_name(format!("{}_optimized.epub", cli.input.file_stem().unwrap().to_string_lossy()))
 	});
-	let outzip: Box<dyn ZipOutput> = if cli.dry_run {
-		Box::new(ZipWriter::new(Cursor::new(Vec::new())))
+	let outzip = if cli.dry_run {
+		ZipWriterEnum::Memory(ZipWriter::new(Cursor::new(Vec::new())))
 	} else {
-		Box::new(ZipWriter::new(
+		ZipWriterEnum::File(ZipWriter::new(
 			File::create(&output_path).wrap_err_with(|| format!("Failed to create output EPUB file: {:?}", output_path))?,
 		))
 	};
@@ -407,7 +452,7 @@ pub fn optimize(cli: &Cli) -> Result<()> {
 	mutable_state.stats.total_images = immutable_state.image_paths.len();
 
 	if !cli.dry_run {
-		add_mimetype_file(&mut *mutable_state.outzip)?;
+		add_mimetype_file(&mut mutable_state.outzip)?;
 	}
 
 	for i in 0..mutable_state.zip.len() {
@@ -444,7 +489,7 @@ pub fn optimize(cli: &Cli) -> Result<()> {
 			_ => {
 				let mut file = file;
 				if !cli.dry_run {
-					copy_file_to_output(&mut file, &name, &mut *mutable_state.outzip)
+					copy_file_to_output(&mut file, &name, &mut mutable_state.outzip)
 						.wrap_err_with(|| format!("Failed to copy file {} to output", name))?;
 				}
 			}
@@ -507,7 +552,7 @@ fn process_html_file(immutable_state: &ImmutableState, mutable_state: &mut Mutab
 fn replace_image_references(
 	regex: &Regex,
 	immutable_state: &ImmutableState,
-	mutable_state: &mut MutableState<impl io::Read + io::Seek + io::Write>,
+	mutable_state: &mut MutableState,
 	content: &str,
 	html_folder: &Path,
 ) -> String {
@@ -537,11 +582,7 @@ fn replace_image_references(
 		.into_owned()
 }
 
-fn get_or_create_optimized_image(
-	immutable_state: &ImmutableState,
-	mutable_state: &mut MutableState<impl io::Read + io::Seek + io::Write>,
-	img_path: &str,
-) -> Result<String> {
+fn get_or_create_optimized_image(immutable_state: &ImmutableState, mutable_state: &mut MutableState, img_path: &str) -> Result<String> {
 	if let Some(optimized_path) = mutable_state.optimized_images.get(img_path) {
 		return Ok(optimized_path.clone());
 	}
@@ -601,14 +642,16 @@ fn get_or_create_optimized_image(
 	Ok(new_path)
 }
 
-fn copy_file_to_output(file: &mut zip::read::ZipFile, name: &str, outzip: &mut dyn ZipOutput) -> Result<()> {
+fn copy_file_to_output(file: &mut zip::read::ZipFile, name: &str, outzip: &mut ZipWriterEnum) -> Result<()> {
 	outzip
 		.start_file(
 			name,
 			SimpleFileOptions::default().compression_method(zip::CompressionMethod::DEFLATE),
 		)
 		.wrap_err_with(|| format!("Failed to start file {} in output ZIP", name))?;
-	std::io::copy(file, outzip).wrap_err_with(|| format!("Failed to copy file {} to output ZIP", name))?;
+	outzip
+		.copy_from(file)
+		.wrap_err_with(|| format!("Failed to copy file {} to output ZIP", name))?;
 	Ok(())
 }
 
@@ -667,15 +710,15 @@ mod tests {
 				"mimetype",
 				SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored),
 			)?;
-			zip.write_all(b"application/epub+zip")?;
+			ZipWriterOps::write_all(&mut zip, b"application/epub+zip")?;
 
 			// Add a simple HTML file
 			zip.start_file("OEBPS/content.xhtml", SimpleFileOptions::default())?;
-			zip.write_all(br#"<html><body><img src="images/test.png"/></body></html>"#)?;
+			ZipWriterOps::write_all(&mut zip, br#"<html><body><img src="images/test.png"/></body></html>"#)?;
 
 			// Add a dummy image
 			zip.start_file("OEBPS/images/test.png", SimpleFileOptions::default())?;
-			zip.write_all(&image_data)?;
+			ZipWriterOps::write_all(&mut zip, &image_data)?;
 
 			zip.finish()?;
 		}
@@ -805,7 +848,8 @@ mod tests {
 		let temp_dir = tempdir()?;
 		let file_path = temp_dir.path().join("test.zip");
 		let file = File::create(&file_path)?;
-		let mut zip = ZipWriter::new(file);
+		use ZipWriterOps;
+		let mut zip = ZipWriterEnum::File(ZipWriter::new(file));
 
 		add_mimetype_file(&mut zip)?;
 		zip.finish()?;
@@ -828,15 +872,15 @@ mod tests {
 		{
 			let mut zip = ZipWriter::new(&mut zip_data);
 			zip.start_file("image1.png", SimpleFileOptions::default())?;
-			zip.write_all(b"fake png data")?;
+			ZipWriterOps::write_all(&mut zip, b"fake png data")?;
 			zip.start_file("image2.jpg", SimpleFileOptions::default())?;
-			zip.write_all(b"fake jpg data")?;
+			ZipWriterOps::write_all(&mut zip, b"fake jpg data")?;
 			zip.start_file("not_an_image.txt", SimpleFileOptions::default())?;
-			zip.write_all(b"not an image")?;
+			ZipWriterOps::write_all(&mut zip, b"not an image")?;
 			zip.finish()?;
 		}
 
-		let mut zip = ZipArchive::new(Cursor::new(zip_data.into_inner()))?;
+		let mut zip = ZipArchiveEnum::Memory(ZipArchive::new(Cursor::new(zip_data.into_inner()))?);
 		let image_paths = collect_image_paths(&mut zip)?;
 
 		assert_eq!(image_paths.len(), 2);
@@ -857,7 +901,7 @@ mod tests {
 		{
 			let mut zip = ZipWriter::new(&mut zip_data);
 			zip.start_file("images/test.png", SimpleFileOptions::default())?;
-			zip.write_all(&image_data)?;
+			ZipWriterOps::write_all(&mut zip, &image_data)?;
 			zip.finish()?;
 		}
 		zip_data.seek(SeekFrom::Start(0))?;
@@ -882,8 +926,8 @@ mod tests {
 		};
 
 		let mut mutable_state = MutableState {
-			zip: ZipArchive::new(zip_data)?,
-			outzip: Box::new(ZipWriter::new(Cursor::new(Vec::new()))),
+			zip: ZipArchive::new(zip_data)?.into(),
+			outzip: ZipWriter::new(Cursor::new(Vec::new())).into(),
 			image_hashes: HashMap::new(),
 			optimized_images: HashMap::new(),
 			stats: Statistics::default(),
