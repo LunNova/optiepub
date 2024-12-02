@@ -27,6 +27,7 @@
           pkgs.pkg-config
           pkgs.openssl
           pkgs.openssl.dev
+					pkgs.bzip2
         ];
 
         LD_LIBRARY_PATH = "/run/opengl-driver/lib/:${pkgs.lib.makeLibraryPath runtimeDeps}";
