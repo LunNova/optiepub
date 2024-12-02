@@ -1,11 +1,7 @@
 {
   inputs = {
-    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    fenix.url = "github:nix-community/fenix";
-    fenix.inputs.nixpkgs.follows = "nixpkgs";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
     flake-utils.url = "github:numtide/flake-utils";
-    naersk.url = "github:nix-community/naersk";
-    naersk.inputs.nixpkgs.follows = "nixpkgs";
   };
 
   outputs = args:
@@ -31,8 +27,6 @@
           pkgs.pkg-config
           pkgs.openssl
           pkgs.openssl.dev
-          pkgs.kdialog
-          pkgs.yad
         ];
 
         LD_LIBRARY_PATH = "/run/opengl-driver/lib/:${pkgs.lib.makeLibraryPath runtimeDeps}";
@@ -47,19 +41,6 @@
           pkgs.just
           pkgs.cmake
         ] ++ runtimeDeps;
-
-        fenix = args.fenix.packages.${system};
-
-        toolchain = with fenix;
-          combine [
-            complete.rustc
-            complete.cargo
-          ];
-
-        naersk = args.naersk.lib.${system}.override {
-          cargo = toolchain;
-          rustc = toolchain;
-        };
 
         glibc = if pkgs.stdenv.isx86_64 then pkgs.glibc_multi else pkgs.glibc;
         self = {
