@@ -1,6 +1,6 @@
 # OptiEPUB
 
-OptiEPUB is a command-line tool for optimizing EPUB files.
+OptiEPUB is a command-line tool for optimizing EPUB files by [LunNova](https://lunnova.dev/).
 
 ## Installation
 
