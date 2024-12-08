@@ -10,9 +10,12 @@ keywords = ["epub", "ebook", "optimization", "compression", "images"]
 categories = ["command-line-utilities", "multimedia::images"]
 readme = "README.md"
 
+[lib]
+path = "lib.rs"
+
 [[bin]]
 name = "optiepub"
-path = "src/main.rs"
+path = "main.rs"
 
 [lints]
 workspace = true
