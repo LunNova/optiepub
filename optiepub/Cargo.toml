@@ -21,7 +21,7 @@ path = "main.rs"
 workspace = true
 
 [dependencies]
-zip = "2.1"
+zip = "2.3"
 eyre = "0.6"
 oxipng = { version = "9.1", default-features = false, features = ["zopfli"] }
 regex = "1.10"
