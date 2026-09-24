@@ -23,7 +23,7 @@ workspace = true
 [dependencies]
 zip = "2.1"
 eyre = "0.6"
-oxipng = { version = "9.1", default-features = false, features = ["zopfli"] }
+oxipng = { version = "10.0", default-features = false, features = ["zopfli"] }
 regex = "1.10"
 image = "0.25"
 mozjpeg = "0.10"
